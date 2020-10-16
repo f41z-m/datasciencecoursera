@@ -1,0 +1,454 @@
+---
+title: "Coursera Data Science Capstone - Prediction model building"
+author: "Samy Soualem"
+date: "September 14, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initialization
+```{r echo = FALSE, results = FALSE, message = FALSE}
+library(quanteda)
+library(ggplot2)
+#library(doParallel)
+library(data.table)
+library(stringr)
+library(foreach)
+library(doSNOW)
+
+source("model/global.R")
+source("model/trainModel.R")
+
+cores <- parallel::detectCores() - 1
+
+# Initialiaze list of DFM
+dtDfmFull <- vector(mode = "list", length = MAX_NGRAM_LEVEL)
+
+print(paste("Time :", Sys.time()))
+```
+
+## Files and directories
+```{r echo = FALSE, results = FALSE}
+# Data source : https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip
+# Data directories
+enUsDir <- "data/final/en_US"
+enUsSampleDir <- file.path(enUsDir, paste0("sample_", FILE_SAMPLE_RATE))
+enFileNames <- c("en_US.blogs.txt", "en_US.news.txt", "en_US.twitter.txt")
+enFile <- file.path(enUsDir, enFileNames)
+
+
+blogSampleFile <- file.path(enUsSampleDir
+                  , paste("en_US.blogs_sample", FILE_SAMPLE_RATE, 1:NB_SUB_FILES, sep = "_")
+                  )
+newsSampleFile <- file.path(enUsSampleDir
+                  , paste("en_US.news_sample", FILE_SAMPLE_RATE, 1:NB_SUB_FILES, sep = "_")
+                  )
+twitterSampleFile <- file.path(enUsSampleDir
+                  , paste("en_US.twitter_sample", FILE_SAMPLE_RATE, 1:NB_SUB_FILES, sep = "_")
+                  )
+
+enSampleFile <- vector(mode = "list", length = NB_SUB_FILES)              
+
+for(i in 1:NB_SUB_FILES) {
+  enSampleFile[[i]] <- c(blogSampleFile[i], newsSampleFile[i], twitterSampleFile[i])
+  enSampleFile[[i]] <- paste0(enSampleFile[[i]], ".txt")
+}
+
+
+
+rdsDir <- paste("data/rds", RDS_FILE_VERSION, paste("sample", FILE_SAMPLE_RATE, sep = '_') , sep = "/")
+```
+
+## RDS files preparation to save the results
+```{r}
+if (! dir.exists(rdsDir)) {
+  dir.create(rdsDir, recursive = TRUE)
+}
+
+rdsSampleRate <- paste("sample", FILE_SAMPLE_RATE, sep ='_')
+rdsSuffix <- ".rds"
+
+# Version and sample rate in file name just in case
+rdsFileSentences <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "sentenceTokens"
+                                                   , 1:NB_SUB_FILES, sep = '_'), rdsSuffix))
+rdsFileDtDfm <- vector(mode = "list", length = MAX_NGRAM_LEVEL)
+
+rdsFileDtDfm[[1]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "dtDfm1", 1:NB_SUB_FILES, sep = '_'), rdsSuffix))
+rdsFileDtDfm[[2]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "dtDfm2", 1:NB_SUB_FILES, sep = '_'), rdsSuffix))
+rdsFileDtDfm[[3]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "dtDfm3", 1:NB_SUB_FILES, sep = '_'), rdsSuffix))
+rdsFileDtDfm[[4]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "dtDfm4", 1:NB_SUB_FILES, sep = '_'), rdsSuffix))
+
+rdsFileDtDfmMerged <- vector(mode = "list", length = MAX_NGRAM_LEVEL)
+rdsFileDtDfmMerged[[1]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "DtDfm1Merged", sep = '_'), rdsSuffix))
+rdsFileDtDfmMerged[[2]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "DtDfm2Merged", sep = '_'), rdsSuffix))
+rdsFileDtDfmMerged[[3]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "DtDfm3Merged", sep = '_'), rdsSuffix))
+rdsFileDtDfmMerged[[4]] <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "DtDfm4Merged", sep = '_'), rdsSuffix))
+
+rdsFileDtDfmFull <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "dtDfmFull", sep = '_'), rdsSuffix))
+rdsFileDtDfmTrim <- file.path(rdsDir, paste0(paste(RDS_FILE_VERSION, rdsSampleRate, "dtDfmTrim", sep = '_'), rdsSuffix))
+```
+
+## Functions
+### Function : load files as a Corpus
+```{r}
+# files = list of files to load as a Corpus
+getCorpus <- function(files) {
+   # Prepare parallel processing
+  cl <- makeSOCKcluster(cores) # start a socket cluster for the numbers of cores available to enable those many parallel R processes
+  registerDoSNOW(cl) # register the SNOW parallel backend with the foreach package
+  
+  # Load file fragments as a Corpus list
+  print("Loading file fragments as a Corpus")
+  pb <- txtProgressBar(max=NB_SUB_FILES, style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress=progress)
+  corpusList <- foreach(i = 1:NB_SUB_FILES,
+                        .packages=c("quanteda"), # mention all packages used in the code block
+                        .options.snow=opts) %dopar% {
+                    
+    corpus(textfile(files[[i]], encoding = "UTF-8"))
+  }    
+  close(pb)
+  # Stop all clusters
+  stopCluster(cl)
+  
+  corpusList
+}
+```
+
+### Function : tokenize sentences in parallel
+```{r}
+# corpus : list of corpus
+getSentenceTokens <- function(corpus) {
+  # Prepare parallel processing
+  cl <- makeSOCKcluster(cores) # start a socket cluster for the numbers of cores available to enable those many parallel R processes
+  registerDoSNOW(cl) # register the SNOW parallel backend with the foreach package
+  
+  # Tokenize sentences
+  print("Tokenizing sentences")
+  pb <- txtProgressBar(max=NB_SUB_FILES, style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress=progress)
+  sentenceTokens <- foreach(i = 1:NB_SUB_FILES,
+                        .packages=c("quanteda"), # mention all packages used in the code block
+                        .export = "tokenizeSentences",
+                        .options.snow=opts) %dopar% {
+                    
+    tokenizeSentences(corpus[[i]])
+  }    
+  close(pb)
+  
+  # Stop all clusters
+  stopCluster(cl)
+  sentenceTokens
+}
+```
+
+### Function : generate n-grams in parallel
+```{r}
+# tokens : sentence tokens
+# n : n-gram level
+# firstFragmentNb : 1st fragment number (from 1 to NB_SUB_FILES)
+generateNgramFiles <- function(tokens, n, firstFragmentNb) {
+  # Prepare parallel processing
+  cl <- makeSOCKcluster(cores) # start a socket cluster for the numbers of cores available to enable those many parallel R processes
+  registerDoSNOW(cl) # register the SNOW parallel backend with the foreach package
+  
+  print(paste0("Tokenizing ", n,"-grams"))
+  pb <- txtProgressBar(max=length(tokens), style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress=progress)
+  null <- foreach(i = 1:length(tokens),
+                        .packages=c("quanteda", "data.table"), # mention all packages used in the code block
+                        .export  = c("rdsFileDtDfm", "generateNgramDt", "generateDfm", 
+                                     "splitNgramPrefix", "getSwearWords", "SENT_START_MARKER"),
+                        .options.snow=opts) %dopar% {
+    
+    if(n == 1) {
+      ignoredFeatures <- c(getSwearWords(), SENT_START_MARKER)
+    } else {
+      ignoredFeatures <- getSwearWords()
+    }
+    
+    dtDfm <-generateNgramDt(tokens[[i]], n, ignoredFeatures)
+    saveRDS(dtDfm, rdsFileDtDfm[[n]][[firstFragmentNb + i - 1]])
+    rm(dtDfm)
+    gc()
+  }    
+  close(pb)
+  
+  # Stop all clusters
+  stopCluster(cl)
+}
+```
+
+### Function : generate n-grams sequentially
+```{r}
+# tokens : sentence tokens
+# n : n-gram level
+generateNgramFilesSequential <- function(tokens, n) {
+  pb <- txtProgressBar(max=NB_SUB_FILES, style = 3)
+  
+  for(i in 1:NB_SUB_FILES) {
+    print(paste0("Tokenizing ", n,"-grams for sample number ", i))
+    if(n == 1) {
+      ignoredFeatures <- c(getSwearWords(), SENT_START_MARKER)
+    } else {
+      ignoredFeatures <- getSwearWords()
+    }
+    
+    dtDfm <-generateNgramDt(tokens[[i]], n, ignoredFeatures)
+    saveRDS(dtDfm, rdsFileDtDfm[[n]][[i]])
+    rm(dtDfm)
+    gc()
+    setTxtProgressBar(pb, i)
+  }    
+  close(pb)
+}
+```
+
+
+### Function : load DFM fragments from RDS files
+```{r}
+# n = n-gram level
+# files = vector of RDS files to load
+getDtDfmFragments <- function(n, rdsFiles) {
+  # Prepare parallel processing
+cl <- makeSOCKcluster(cores) # start a socket cluster for the numbers of cores available to enable those many parallel R processes
+registerDoSNOW(cl) # register the SNOW parallel backend with the foreach package
+
+# Read n-grams data tables files
+print(paste("Loading files :", rdsFiles))
+pb <- txtProgressBar(max=NB_SUB_FILES, style = 3)
+progress <- function(n) setTxtProgressBar(pb, n)
+opts <- list(progress=progress)
+dfmFragments <- foreach(i = 1:NB_SUB_FILES,
+                      .packages=c("data.table"), # mention all packages used in the code block
+                      .options.snow=opts) %dopar% {
+  
+  # Load n-grams
+  #readRDS(rdsFileDtDfm[[n]][i])
+  readRDS(rdsFiles[i])
+}
+
+close(pb)
+gc()
+
+# Stop all clusters
+stopCluster(cl)
+
+dfmFragments
+}
+```
+
+## Creating sampled files
+
+Total file sample rate : `r I(FILE_SAMPLE_RATE * 100)`%.
+
+
+```{r echo = FALSE, results = FALSE}
+print(paste("Time :", Sys.time()))
+
+# Stop with an error if the original files are not found
+if (! all(file.exists(enFile))) {
+  errMsg <- paste("The following files were not found :", paste(enFile, collapse = ", "))
+  stop(errMsg)
+}
+
+
+# If all the sample files don't already exist for this sample rate, create them
+if (! all(file.exists(unlist(enSampleFile)))) {
+  if (! dir.exists(enUsSampleDir)) {
+    dir.create(enUsSampleDir)
+  }
+  
+  # Read all files, generate a random sample and save it to another file for later use
+  
+  
+  set.seed(1234)
+  for(i in 1:length(enFile)) {
+    print(paste("Loading file :", enFile[i]))
+    
+    # Read whole file
+    fullfile <- readLines(enFile[i])
+    
+    # Split into NB_SUB_FILES fragments
+    totalSampleNbLines <- ceiling(SUB_FILE_SAMPLE_RATE * NB_SUB_FILES * length(fullfile))
+    tempData <- sample(fullfile, totalSampleNbLines)
+    
+    subFileNbLines <- totalSampleNbLines / NB_SUB_FILES
+    
+    splitFactor <- ceiling(seq_along(tempData) / subFileNbLines)
+    subFileData <- split(tempData, splitFactor)
+    
+    # If there is a chunk with the number (NB_SUB_FILES + 1), add it to the NB_SUB_FILES element
+    # to have exactly NB_SUB_FILES files
+    if(length(subFileData) > NB_SUB_FILES) {
+      subFileData[[NB_SUB_FILES]] <- c(subFileData[[NB_SUB_FILES]], subFileData[[NB_SUB_FILES + 1]])
+    }
+    
+    print(paste("splitting and saving file :", enFile[i], "into", NB_SUB_FILES, "fragments"))
+    pb <- txtProgressBar(max=NB_SUB_FILES, style = 3)
+    # Save all sub file samples to files
+    for(j in 1:NB_SUB_FILES) {
+      writeLines(subFileData[[j]], enSampleFile[[j]][i])
+      setTxtProgressBar(pb, j)
+    }
+    close(pb)
+  }
+  # Free memory (not very useful in general apparently)
+  rm(fullfile)
+  rm(tempData)
+  rm(subFileData)
+  gc()  # garbage collector
+}
+# Sample files here, nothing to do
+
+print(paste("Time :", Sys.time()))
+```
+
+
+
+
+
+## Generate DFM fragments and save them to RDS files
+```{r}
+# If the DFM fragments files are not there, generate and save them to files
+if (! all(file.exists(unlist(rdsFileDtDfm)))) {
+  print(paste("Time :", Sys.time()))
+  enRawCorpus <- getCorpus(enSampleFile)
+  print(paste("Time :", Sys.time()))
+  
+  sentenceTokens <- getSentenceTokens(enRawCorpus)
+  print(paste("Time :", Sys.time()))
+  rm(enRawCorpus)
+  gc()
+  
+  # Limit number of parallel tasks for n-gram creation because of RAM limitations
+  maxParallelNb <- 6
+  nbIterations <- ceiling(NB_SUB_FILES / maxParallelNb)
+  
+  # Generate DFM for each n-gram level and save them to RDS files
+  for(i in 1:MAX_NGRAM_LEVEL) {
+    print(paste("Time :", Sys.time()))
+    
+    # Another loop level to avoid processing everything in parallel at once
+    for(j in 0:(nbIterations - 1)) {
+      print(paste("Creating n-grams with n =", i, "- Iteration", j + 1, "out of", nbIterations))
+      
+      idxStart <- maxParallelNb * j + 1
+      idxEnd <- maxParallelNb * j + maxParallelNb
+      
+      if(idxEnd > NB_SUB_FILES) {
+        idxEnd <- NB_SUB_FILES
+      }
+      
+      generateNgramFiles(sentenceTokens[idxStart:idxEnd], i, idxStart)
+      gc()
+    }
+    
+    # Backup method : do everything in sequence 
+    #generateNgramFilesSequential(sentenceTokens, i)
+    gc()
+  }
+  rm(sentenceTokens)
+  gc()
+  
+} else {
+  # do nothing
+}
+print(paste("Time :", Sys.time()))
+```
+
+
+
+
+
+## Aggregate n-grams fragments into data tables
+```{r}
+
+# Complete DFM file exists
+if (file.exists(rdsFileDtDfmFull)) {
+  print(paste0("Loading complete DFM from file ", rdsFileDtDfmFull))
+  dtDfmFull <- readRDS(rdsFileDtDfmFull)
+# Merged DFM exist for all n-gram levels
+} else if(all(file.exists(unlist(rdsFileDtDfmMerged)))) {
+  for(n in 1:MAX_NGRAM_LEVEL) {
+    print(paste0("Loading merged ", n, "-grams DFM from file ", rdsFileDtDfmMerged[[n]]))
+    dtDfmFull[[n]] <- readRDS(rdsFileDtDfmMerged[[n]])
+  }
+  print(paste0("Saving complete DFM to file ", rdsFileDtDfmFull))
+  saveRDS(dtDfmFull, rdsFileDtDfmFull)
+# Merge DFM for all n-gram levels
+} else {
+  for(n in 1:MAX_NGRAM_LEVEL) {
+    # Load DFM fragments files
+    print(paste("Time :", Sys.time()))
+    tempDfm <- getDtDfmFragments(1, rdsFileDtDfm[[n]])
+    print(paste("Time :", Sys.time()))
+  
+    # Init with first data.table
+    dtDfmMergedTemp <- tempDfm[[1]]
+    gc()
+    
+    # TODO : merge using divide and conquer instead of a sequential loop to reduce processing time
+    
+    # Aggregate smaller n-grams data tables
+    print(paste0("Merging ", n, "-grams DFM"))
+    colToRm <- c("count.x", "count.y")
+    pb <- txtProgressBar(max=NB_SUB_FILES, style = 3)
+    for(i in 2:NB_SUB_FILES) {
+      # Merge the data tables by ngram (prefix + lastWord) => full outer join
+      dtDfmMergedTemp <- merge(dtDfmMergedTemp, tempDfm[[i]], by = c("prefix", "lastWord"), all = TRUE)
+      
+      # transform NA into 0
+      dtDfmMergedTemp[is.na(count.x), count.x := 0]
+      dtDfmMergedTemp[is.na(count.y), count.y := 0] 
+      
+      # Add the ngram counts
+      dtDfmMergedTemp[, count := count.x + count.y] 
+      
+      # Remove individual count results
+      dtDfmMergedTemp[, (colToRm) := NULL]
+     
+      setTxtProgressBar(pb, i) 
+    }
+    print(paste0("Saving merged ", n, "-grams DFM to file ", rdsFileDtDfmMerged[[n]]))
+    saveRDS(dtDfmMergedTemp, rdsFileDtDfmMerged[[n]])
+    close(pb)
+  }
+  # Save complete DFM
+  for(n in 1:MAX_NGRAM_LEVEL) {
+    print(paste0("Loading merged ", n, "-grams DFM from file ", rdsFileDtDfmMerged[[n]]))
+    dtDfmFull[[n]] <- readRDS(rdsFileDtDfmMerged[[n]])
+  }
+  print(paste0("Saving complete DFM to file ", rdsFileDtDfmFull))
+  saveRDS(dtDfmFull, rdsFileDtDfmFull)
+}
+
+print(paste("Time :", Sys.time()))
+```
+
+
+
+
+## Remove low-frequency n-grams to reduce model size and lower response time
+```{r}
+if (!file.exists(rdsFileDtDfmTrim)) {
+  dtDfmTrim <- vector(mode = "list", length = MAX_NGRAM_LEVEL)
+  
+  print(paste("Trimming DFM. MIN_NGRAM_COUNT =", MIN_NGRAM_COUNT))
+  # Delete low frequency ngram
+  for(i in 1:MAX_NGRAM_LEVEL) {
+    dtDfmTrim[[i]] <- dtDfmFull[[i]][count >= MIN_NGRAM_COUNT, ]
+  }
+  print(paste("Saving trimmed DFM to file", rdsFileDtDfmTrim))
+  saveRDS(dtDfmTrim, rdsFileDtDfmTrim)
+} else {
+  dtDfmTrim <- readRDS(rdsFileDtDfmTrim)
+}
+print(paste("Time :", Sys.time()))
+```
